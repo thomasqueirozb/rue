@@ -1,15 +1,21 @@
 use std::{collections::HashMap, os::unix::process::CommandExt, process::Command};
 
-use nix::{
-    sys::{ptrace, wait::waitpid},
-    unistd::Pid,
+use nix::sys::{
+    ptrace::{self, AddressType},
+    wait::waitpid,
 };
+use nix::unistd::Pid;
 use owo_colors::OwoColorize;
 use serde_json::Value;
 
+enum Argument {
+    CharPointer,
+    Other,
+}
+
 struct Syscall {
     name: String,
-    args: Vec<String>,
+    args: Vec<Argument>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -28,7 +34,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .filter_map(|v| v.as_object().unwrap().get("type"))
                 .map(Value::as_str)
                 .map(Option::unwrap)
-                .map(String::from)
+                .map(|s| {
+                    if s.starts_with("const char __user * ") || s.starts_with("char __user * ") {
+                        Argument::CharPointer
+                    } else {
+                        Argument::Other
+                    }
+                })
                 .collect();
 
             (rax, Syscall { name, args })
@@ -60,8 +72,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let args = [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9]; // See: man 2 syscall
             let args: Vec<String> = args
                 .into_iter()
-                .take(syscall.args.len())
-                .map(|r| format!("{r:x}").blue().to_string())
+                .zip(&syscall.args)
+                .map(|(reg, arg)| {
+                    match arg {
+                        Argument::CharPointer => {
+                            format!(
+                                "\"{}\"",
+                                read_char_pointer(child_pid, reg).unwrap_or_default()
+                            )
+                        }
+                        Argument::Other => format!("{reg:x}"),
+                    }
+                    .blue()
+                    .to_string()
+                })
                 .collect();
 
             eprintln!(
@@ -73,4 +97,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         is_sys_exit = !is_sys_exit;
     }
+}
+
+fn read_char_pointer(pid: Pid, addr: u64) -> Result<String, ()> {
+    let mut buffer = vec![];
+    for addr in (addr..).step_by(8) {
+        match ptrace::read(pid, addr as AddressType) {
+            Ok(data) => {
+                let data = data.to_le_bytes();
+                match data.iter().position(|&b| b == 0u8) {
+                    Some(position) => {
+                        buffer.extend_from_slice(&data[..position]);
+                        break;
+                    }
+                    None => buffer.extend_from_slice(&data),
+                }
+            }
+            Err(_e) => break,
+        }
+    }
+
+    Ok(String::from_utf8_lossy(&buffer[..]).into_owned())
 }
