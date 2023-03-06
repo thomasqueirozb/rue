@@ -5,18 +5,33 @@ use nix::{
     unistd::Pid,
 };
 use owo_colors::OwoColorize;
+use serde_json::Value;
+
+struct Syscall {
+    name: String,
+    args: Vec<String>,
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let json: serde_json::Value = serde_json::from_str(include_str!("syscall.json"))?;
-    let syscall_table: HashMap<u64, String> = json["aaData"]
+    let syscall_table: HashMap<u64, Syscall> = json["aaData"]
         .as_array()
         .unwrap()
         .iter()
         .map(|item| {
-            (
-                item[0].as_u64().unwrap(),
-                item[1].as_str().unwrap().to_owned(),
-            )
+            let mut items = item.as_array().unwrap().iter();
+            let rax = items.next().unwrap().as_u64().unwrap();
+            let name = items.next().unwrap().as_str().unwrap().into();
+            let args = items.skip(1).take(6);
+
+            let args = args
+                .filter_map(|v| v.as_object().unwrap().get("type"))
+                .map(Value::as_str)
+                .map(Option::unwrap)
+                .map(String::from)
+                .collect();
+
+            (rax, Syscall { name, args })
         })
         .collect();
 
@@ -40,13 +55,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = waitpid(child_pid, None)?;
         if is_sys_exit {
             let regs = ptrace::getregs(child_pid)?;
+            let syscall = &syscall_table[&regs.orig_rax];
+
+            let args = [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9]; // See: man 2 syscall
+            let args: Vec<String> = args
+                .into_iter()
+                .take(syscall.args.len())
+                .map(|r| format!("{r:x}").blue().to_string())
+                .collect();
+
             eprintln!(
-                "{}({:x}, {:x}, {:x}, ...) = {:x}",
-                syscall_table[&regs.orig_rax].green(),
-                regs.rdi.blue(),
-                regs.rsi.blue(),
-                regs.rdx.blue(),
-                regs.rax.yellow(),
+                "{}({}) = {:x}",
+                syscall.name.green(),
+                args.join(", "),
+                regs.rax.yellow()
             );
         }
         is_sys_exit = !is_sys_exit;
